@@ -15,7 +15,7 @@ def setup_logging(app_env: str, log_dir: Path, level: str | int = "DEBUG"):
     logger.remove()
 
     logger.add(
-        sys.stderr,
+        sys.stdout,
         level=level,
         colorize=True,
         format=CONSOLE_FORMAT,

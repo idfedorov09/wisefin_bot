@@ -2,3 +2,9 @@ loguru==0.7.3
 python-dotenv==1.0.1
 pydantic==2.11.7
 pydantic-settings==2.10.1
+contextvars==2.4
+aiogram==3.22.0
+APScheduler==3.11.0
+SQLAlchemy==2.0.44
+greenlet==3.2.4
+aiosqlite==0.21.0

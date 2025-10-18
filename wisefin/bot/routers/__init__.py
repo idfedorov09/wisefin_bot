@@ -1,0 +1,1 @@
+from wisefin.bot.routers.routers import configure_routers

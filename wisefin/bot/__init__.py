@@ -1,0 +1,1 @@
+from wisefin.bot.bot import start_polling

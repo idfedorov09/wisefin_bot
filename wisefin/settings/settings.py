@@ -14,5 +14,7 @@ class Settings(BaseSettings):
     LOG_DIR_PATH: Path = Field(default="../logs")
     LOG_LEVEL: str = Field(default="INFO")
 
+    BOT_TOKEN: str = Field()
+
 
 settings = Settings()
