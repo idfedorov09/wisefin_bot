@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file_encoding="utf-8")
 
     APP_ENV: str = Field(default="dev")
-    LOG_DIR_PATH: Path = Field(default="../logs")
+    LOG_DIR_PATH: Path = Field(default="./logs/")
     LOG_LEVEL: str = Field(default="INFO")
 
     BOT_TOKEN: str = Field()

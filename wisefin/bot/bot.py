@@ -20,7 +20,8 @@ AppContext.set(bot)
 
 async def on_shutdown():
     scheduler = AppContext.get(AsyncIOScheduler)
-    scheduler.shutdown()
+    if scheduler is not None:
+        scheduler.shutdown()
 
 
 async def start_polling():
