@@ -16,5 +16,8 @@ class Settings(BaseSettings):
 
     BOT_TOKEN: str = Field()
 
+    DB_URL: str = Field(default="sqlite+aiosqlite:///bot.db")
+    DB_CREATE_FSM_TABLE: bool = Field(default=True)
+
 
 settings = Settings()

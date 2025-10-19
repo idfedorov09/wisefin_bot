@@ -10,12 +10,11 @@ from wisefin.bot.routers import configure_routers
 from wisefin.settings import settings
 from wisefin.commons.context import AppContext
 
-bot = Bot(
-    token=settings.BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
 
-AppContext.set(bot)
+async def on_startup():
+    scheduler = AsyncIOScheduler()
+    AppContext.set(scheduler)
+    scheduler.start()
 
 
 async def on_shutdown():
@@ -25,15 +24,23 @@ async def on_shutdown():
 
 
 async def start_polling():
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    AppContext.set(bot)
+
     dp = Dispatcher(
         storage=await SQLAlchemyStorage.from_url(
-            url="sqlite+aiosqlite:///fsm.db",
-            create_table=True,
+            url=settings.DB_URL,
+            create_table=settings.DB_CREATE_FSM_TABLE,
         ),
         events_isolation=ChatEventIsolation()
     )
 
     configure_routers(dp)
+
+    dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
     await commands_config()
@@ -41,6 +48,7 @@ async def start_polling():
 
 
 async def commands_config():
+    bot = AppContext.get(Bot)
     commands = [
         # TODO
         # BotCommand(command="bug",  description="Сообщить о баге"),
