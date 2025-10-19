@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
+import os
 from abc import ABC, abstractmethod
 from contextlib import suppress
-from typing import Any, Dict, Mapping, Optional, cast
+from enum import Enum
+from typing import Any, Dict, Mapping, Optional, cast, Literal, Union
 from aiogram.exceptions import DataNotDictLikeError
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import (
@@ -12,7 +15,7 @@ from aiogram.fsm.storage.base import (
     StateType,
     StorageKey,
 )
-from sqlalchemy import String, DateTime, func
+from sqlalchemy import String, DateTime, func, inspect
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -29,6 +32,20 @@ try:
 except Exception:
     JSON_AUTO = SAJSON()
 
+
+class SchemaMode(str, Enum):
+    NONE = "none"
+    VALIDATE = "validate"
+    UPDATE = "update"
+    CREATE = "create"
+    CREATE_DROP = "create-drop"
+
+_Event = Literal["start", "stop"]
+
+# TODO: set to VALIDATE
+_default_schema_mode = SchemaMode(
+    os.getenv("AIOGRAM_SQLALCHEMY_STORAGE_SCHEMA_MODE", SchemaMode.CREATE_DROP.value)
+)
 
 class Base(DeclarativeBase):
     pass
@@ -114,14 +131,16 @@ class SQLAlchemyStorage(BaseStorage):
             engine: AsyncEngine,
             *,
             key_builder: Optional[KeyBuilder] = None,
+            schema_mode: Optional[Union[SchemaMode, str]] = _default_schema_mode,
             table_name: str = "aiogram_fsm",
-            create_table: bool = False,
             session_context: Optional[BaseSessionContext] = None,
             sessionmaker_kwargs: Optional[Dict[str, Any]] = None,
             use_transaction: bool = True,
     ) -> None:
         if table_name != FSMRow.__tablename__:
             FSMRow.__tablename__ = table_name  # type: ignore[attr-defined]
+        if isinstance(schema_mode, str):
+            schema_mode = SchemaMode(schema_mode)
 
         self._key_builder: KeyBuilder = key_builder or DefaultKeyBuilder()
         self._engine: AsyncEngine = engine
@@ -131,7 +150,8 @@ class SQLAlchemyStorage(BaseStorage):
             sessionmaker_kwargs,
             use_transaction
         )
-        self._create_table_on_init = create_table
+        self._schema_mode = schema_mode or SchemaMode.NONE
+        self._logger = logging.getLogger(__name__)
 
     @staticmethod
     def _make_simple_session_context(
@@ -155,7 +175,7 @@ class SQLAlchemyStorage(BaseStorage):
             key_builder: Optional[KeyBuilder] = None,
             session_context: Optional[BaseSessionContext] = None,
             table_name: str = "aiogram_fsm",
-            create_table: bool = True,
+            schema_mode: Optional[Union[SchemaMode, str]] = _default_schema_mode,
             engine_kwargs: Optional[Dict[str, Any]] = None,
             sessionmaker_kwargs: Optional[Dict[str, Any]] = None,
     ) -> "SQLAlchemyStorage":
@@ -165,16 +185,36 @@ class SQLAlchemyStorage(BaseStorage):
             key_builder=key_builder,
             session_context=session_context,
             table_name=table_name,
-            create_table=create_table,
             sessionmaker_kwargs=sessionmaker_kwargs,
+            schema_mode=schema_mode
         )
-        if create_table:
-            await storage.create_tables()
+        await storage.schema_event("start")
         return storage
 
-    async def create_tables(self) -> None:
-        async with self._engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+    async def schema_event(self, event: _Event) -> None:
+        # TODO: более красивая реализация?
+        # TODO: работать ТОЛЬКО с таблицей fsm
+        if self._schema_mode == SchemaMode.NONE:
+            return
+        elif self._schema_mode == SchemaMode.CREATE:
+            async with self._engine.begin() as conn:
+                if event == "start":
+                    self._logger.debug("Recreate fsm schema (drop and create)")
+                    await conn.run_sync(Base.metadata.drop_all)
+                    await conn.run_sync(Base.metadata.create_all)
+        elif self._schema_mode == SchemaMode.CREATE_DROP:
+            async with self._engine.begin() as conn:
+                if event == "start":
+                    self._logger.debug("Create fsm schema")
+                    await conn.run_sync(Base.metadata.create_all)
+                elif event == "stop":
+                    self._logger.debug("Drop fsm schema")
+                    await conn.run_sync(Base.metadata.drop_all)
+        elif self._schema_mode == SchemaMode.UPDATE:
+            raise NotImplementedError("Implement using alembic")
+        elif self._schema_mode == SchemaMode.VALIDATE:
+            raise NotImplementedError("Check the fact fsm_table is created with correct schema")
+
 
     @staticmethod
     def resolve_state(value: StateType) -> Optional[str]:
@@ -257,4 +297,5 @@ class SQLAlchemyStorage(BaseStorage):
             return cast(Dict[str, Any], row.data or {}) if row else {}
 
     async def close(self) -> None:  # pragma: no cover
+        await self.schema_event("stop")
         await self._engine.dispose()
