@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from contextlib import suppress
 from typing import Any, Dict, Mapping, Optional, cast
 
 from aiogram.exceptions import DataNotDictLikeError
@@ -24,6 +26,7 @@ from sqlalchemy.types import JSON as SAJSON
 
 try:
     from sqlalchemy.dialects.postgresql import JSONB
+
     JSON_AUTO = SAJSON().with_variant(JSONB, "postgresql")
 except Exception:
     JSON_AUTO = SAJSON()
@@ -47,6 +50,59 @@ class FSMRow(Base):
     )
 
 
+class BaseSessionContext(ABC):
+    """Базовый интерфейс для фабрик асинхронных контекстных менеджеров."""
+
+    @abstractmethod
+    def __call__(self) -> "BaseSessionContext":
+        """Возвращает новый контекстный менеджер (обычно self или новый экземпляр)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def __aenter__(self) -> AsyncSession:
+        """Вход в контекст, возвращает асинхронную сессию."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Выход из контекста, выполняет commit/rollback."""
+        raise NotImplementedError
+
+
+class SimpleSessionContext(BaseSessionContext):
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], use_transaction: bool = True):
+        self._sessionmaker = sessionmaker
+        self._use_transaction = use_transaction
+        self._session: Optional[AsyncSession] = None
+        self._transaction = None
+
+    def __call__(self) -> "SimpleSessionContext":
+        return SimpleSessionContext(self._sessionmaker, self._use_transaction)
+
+    async def __aenter__(self) -> AsyncSession:
+        self._session = self._sessionmaker()
+        try:
+            if self._use_transaction:
+                self._transaction = await self._session.begin()
+            return self._session
+        except:
+            with suppress(Exception):
+                await self._session.close()
+            raise
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        try:
+            if self._use_transaction and self._transaction is not None:
+                if exc_type:
+                    with suppress(Exception):
+                        await self._transaction.rollback()
+                else:
+                    await self._transaction.commit()
+        finally:
+            if self._session is not None:
+                await self._session.close()
+
+
 class SQLAlchemyStorage(BaseStorage):
     """
     FSM storage для aiogram 3.x на SQLAlchemy 2.x (async ORM).
@@ -62,23 +118,29 @@ class SQLAlchemyStorage(BaseStorage):
             key_builder: Optional[KeyBuilder] = None,
             table_name: str = "aiogram_fsm",
             create_table: bool = False,
+            session_context: Optional[BaseSessionContext] = None,
             sessionmaker_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
-        # Позволяем смену имени таблицы (если надо)
         if table_name != FSMRow.__tablename__:
             FSMRow.__tablename__ = table_name  # type: ignore[attr-defined]
 
-        self._engine: AsyncEngine = engine
         self._key_builder: KeyBuilder = key_builder or DefaultKeyBuilder()
+        self._engine: AsyncEngine = engine
+        self._session_context = session_context \
+                                or SQLAlchemyStorage._make_simple_session_context(engine, sessionmaker_kwargs)
+        self._create_table_on_init = create_table
 
+    @staticmethod
+    def _make_simple_session_context(
+            engine: AsyncEngine,
+            sessionmaker_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> SimpleSessionContext:
         sm_kwargs = {"expire_on_commit": False}
         if sessionmaker_kwargs:
             sm_kwargs.update(sessionmaker_kwargs)
-
-        self._sessionmaker = async_sessionmaker(self._engine, **sm_kwargs)
-        self._create_table_on_init = create_table
-
-    # ---------- Фабрика ----------
+        return SimpleSessionContext(
+            sessionmaker=async_sessionmaker(engine, **sm_kwargs)
+        )
 
     @classmethod
     async def from_url(
@@ -86,6 +148,7 @@ class SQLAlchemyStorage(BaseStorage):
             url: str,
             *,
             key_builder: Optional[KeyBuilder] = None,
+            session_context: Optional[BaseSessionContext] = None,
             table_name: str = "aiogram_fsm",
             create_table: bool = True,
             engine_kwargs: Optional[Dict[str, Any]] = None,
@@ -95,6 +158,7 @@ class SQLAlchemyStorage(BaseStorage):
         storage = cls(
             engine=engine,
             key_builder=key_builder,
+            session_context=session_context,
             table_name=table_name,
             create_table=create_table,
             sessionmaker_kwargs=sessionmaker_kwargs,
@@ -106,8 +170,6 @@ class SQLAlchemyStorage(BaseStorage):
     async def create_tables(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-
-    # ---------- Вспомогательные ----------
 
     @staticmethod
     def resolve_state(value: StateType) -> Optional[str]:
@@ -123,13 +185,11 @@ class SQLAlchemyStorage(BaseStorage):
         if (row.state is None) and (not row.data):
             await session.delete(row)
 
-    # ---------- Реализация BaseStorage ----------
-
     async def set_state(self, key: StorageKey, state: StateType = None) -> None:
         row_id = self._key_builder.build(key)
         resolved = self.resolve_state(state)
 
-        async with self._sessionmaker() as session, session.begin():
+        async with self._session_context() as session:
             row: Optional[FSMRow] = await session.get(FSMRow, row_id)
 
             if resolved is None:
@@ -146,7 +206,7 @@ class SQLAlchemyStorage(BaseStorage):
 
     async def get_state(self, key: StorageKey) -> Optional[str]:
         row_id = self._key_builder.build(key)
-        async with self._sessionmaker() as session:
+        async with self._session_context() as session:
             row = await session.get(FSMRow, row_id)
             return cast(Optional[str], row.state if row else None)
 
@@ -159,7 +219,7 @@ class SQLAlchemyStorage(BaseStorage):
         row_id = self._key_builder.build(key)
         payload: Optional[Dict[str, Any]] = dict(data) if data else None
 
-        async with self._sessionmaker() as session, session.begin():
+        async with self._session_context() as session:
             row: Optional[FSMRow] = await session.get(FSMRow, row_id)
 
             if payload is None:
@@ -176,7 +236,7 @@ class SQLAlchemyStorage(BaseStorage):
 
     async def get_data(self, key: StorageKey) -> Dict[str, Any]:
         row_id = self._key_builder.build(key)
-        async with self._sessionmaker() as session:
+        async with self._session_context() as session:
             row = await session.get(FSMRow, row_id)
             return cast(Dict[str, Any], row.data or {}) if row else {}
 
