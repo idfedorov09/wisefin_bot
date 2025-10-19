@@ -3,7 +3,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import suppress
 from typing import Any, Dict, Mapping, Optional, cast
-
 from aiogram.exceptions import DataNotDictLikeError
 from aiogram.fsm.state import State
 from aiogram.fsm.storage.base import (
@@ -13,7 +12,6 @@ from aiogram.fsm.storage.base import (
     StateType,
     StorageKey,
 )
-
 from sqlalchemy import String, DateTime, func
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -120,6 +118,7 @@ class SQLAlchemyStorage(BaseStorage):
             create_table: bool = False,
             session_context: Optional[BaseSessionContext] = None,
             sessionmaker_kwargs: Optional[Dict[str, Any]] = None,
+            use_transaction: bool = True,
     ) -> None:
         if table_name != FSMRow.__tablename__:
             FSMRow.__tablename__ = table_name  # type: ignore[attr-defined]
@@ -127,19 +126,25 @@ class SQLAlchemyStorage(BaseStorage):
         self._key_builder: KeyBuilder = key_builder or DefaultKeyBuilder()
         self._engine: AsyncEngine = engine
         self._session_context = session_context \
-                                or SQLAlchemyStorage._make_simple_session_context(engine, sessionmaker_kwargs)
+                                or SQLAlchemyStorage._make_simple_session_context(
+            engine,
+            sessionmaker_kwargs,
+            use_transaction
+        )
         self._create_table_on_init = create_table
 
     @staticmethod
     def _make_simple_session_context(
             engine: AsyncEngine,
             sessionmaker_kwargs: Optional[Dict[str, Any]] = None,
+            use_transaction: bool = True,
     ) -> SimpleSessionContext:
         sm_kwargs = {"expire_on_commit": False}
         if sessionmaker_kwargs:
             sm_kwargs.update(sessionmaker_kwargs)
         return SimpleSessionContext(
-            sessionmaker=async_sessionmaker(engine, **sm_kwargs)
+            sessionmaker=async_sessionmaker(engine, **sm_kwargs),
+            use_transaction=use_transaction
         )
 
     @classmethod
@@ -179,7 +184,18 @@ class SQLAlchemyStorage(BaseStorage):
             return value.state
         return str(value)
 
-    async def _delete_if_empty(self, session: AsyncSession, row: Optional[FSMRow]) -> None:
+    @staticmethod
+    async def _delete_if_empty(session: AsyncSession, row: Optional[FSMRow]) -> None:
+        """
+        Удаляет запись FSMRow из базы, если она пуста.
+
+        Запись считается пустой, если:
+        - поле `state` равно None
+        - поле `data` отсутствует или пустое
+
+        :param session: Активная асинхронная сессия SQLAlchemy.
+        :param row: Экземпляр FSMRow (или None), который необходимо проверить и при необходимости удалить.
+        """
         if row is None:
             return
         if (row.state is None) and (not row.data):
