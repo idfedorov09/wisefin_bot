@@ -367,6 +367,7 @@ class SQLAlchemyStorage(BaseStorage):
             sessionmaker_kwargs: Optional[Dict[str, Any]] = None,
             use_transaction: bool = True,
     ) -> None:
+        # TODO: траблы с table_name
         if table_name != FSMRow.__tablename__:
             FSMRow.__tablename__ = table_name  # type: ignore[attr-defined]
         if isinstance(schema_mode, str):
@@ -423,7 +424,7 @@ class SQLAlchemyStorage(BaseStorage):
             sessionmaker_kwargs=sessionmaker_kwargs,
             schema_mode=schema_mode
         )
-        await storage.schema_event("start")
+        await storage.schema_event("start") # TODO: а если экземпляр создается через __init__ ?
         return storage
 
     async def schema_event(self, event: _Event) -> None:
