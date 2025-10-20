@@ -37,15 +37,26 @@ class SchemaMode(str, Enum):
     NONE = "none"
     CREATE = "create"
     CREATE_DROP = "create-drop"
-    VALIDATE = "validate"  # TODO: to impl
-    UPDATE = "update"  # TODO: to impl
+    VALIDATE = "validate"
+    UPDATE = "update"
+
+
+class SchemaError(RuntimeError):
+    """Base class for schema related errors."""
+
+
+class SchemaValidationError(SchemaError):
+    """Raised when database schema validation fails."""
+
+
+class SchemaUpdateError(SchemaError):
+    """Raised when database schema auto-update fails."""
 
 
 _Event = Literal["start", "stop"]
 
-# TODO: set to VALIDATE
 _default_schema_mode = SchemaMode(
-    os.getenv("AIOGRAM_SQLALCHEMY_STORAGE_SCHEMA_MODE", SchemaMode.CREATE_DROP.value)
+    os.getenv("AIOGRAM_SQLALCHEMY_STORAGE_SCHEMA_MODE", SchemaMode.UPDATE.value)
 )
 
 
@@ -90,11 +101,151 @@ class CreateDropSchemaModeStrategy(BaseSchemaModeStrategy):
             await conn.run_sync(Base.metadata.drop_all)
 
 
+class ValidateSchemaModeStrategy(BaseSchemaModeStrategy):
+    def __init__(self) -> None:
+        self._table = FSMRow.__table__
+
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(self._validate_table)
+
+    async def on_stop(self, engine: AsyncEngine) -> None:
+        pass
+
+    def _validate_table(self, sync_conn) -> None:
+        inspector = inspect(sync_conn)
+        table_name = self._table.name
+
+        if not inspector.has_table(table_name):
+            raise SchemaValidationError(
+                f"Table `{table_name}` is missing; run with schema_mode='create' or 'update' first."
+            )
+
+        actual_columns = {col["name"]: col for col in inspector.get_columns(table_name)}
+        expected_columns = {column.name: column for column in self._table.columns}
+
+        missing_columns = sorted(set(expected_columns) - set(actual_columns))
+        unexpected_columns = sorted(set(actual_columns) - set(expected_columns))
+        if missing_columns:
+            raise SchemaValidationError(
+                f"Missing columns in `{table_name}`: {', '.join(missing_columns)}"
+            )
+        if unexpected_columns:
+            raise SchemaValidationError(
+                f"Unexpected columns in `{table_name}`: {', '.join(unexpected_columns)}"
+            )
+
+        dialect = inspector.bind.dialect
+        for column_name, expected in expected_columns.items():
+            actual = actual_columns[column_name]
+            expected_type = expected.type.compile(dialect=dialect).lower()
+            actual_type = actual["type"].compile(dialect=dialect).lower()
+            if expected_type != actual_type:
+                raise SchemaValidationError(
+                    f"Column `{column_name}` type mismatch: expected {expected_type}, got {actual_type}"
+                )
+
+            expected_nullable = bool(expected.nullable)
+            actual_nullable = bool(actual.get("nullable", True))
+            if expected_nullable != actual_nullable:
+                raise SchemaValidationError(
+                    f"Column `{column_name}` nullable mismatch: expected {expected_nullable}, got {actual_nullable}"
+                )
+
+            expected_default = expected.server_default is not None
+            actual_default = actual.get("default") is not None
+            if expected_default != actual_default:
+                raise SchemaValidationError(
+                    f"Column `{column_name}` server default presence mismatch."
+                )
+
+        expected_pk = tuple(column.name for column in self._table.primary_key.columns)
+        pk_info = inspector.get_pk_constraint(table_name) or {}
+        actual_pk = tuple(pk_info.get("constrained_columns") or ())
+        if expected_pk != actual_pk:
+            raise SchemaValidationError(
+                f"Primary key mismatch: expected {expected_pk or 'none'}, got {actual_pk or 'none'}"
+            )
+
+
+class UpdateSchemaModeStrategy(BaseSchemaModeStrategy):
+    def __init__(self) -> None:
+        self._table = FSMRow.__table__
+
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(self._auto_upgrade)
+
+    async def on_stop(self, engine: AsyncEngine) -> None:
+        pass
+
+    def _auto_upgrade(self, sync_conn) -> None:
+        try:
+            from alembic.autogenerate import api as alembic_autogen
+            from alembic.migration import MigrationContext
+            from alembic.operations import BatchOperations, Operations
+            from alembic.operations import ops as alembic_ops
+        except ImportError as exc:  # pragma: no cover
+            raise SchemaUpdateError(
+                "Alembic is required for schema_mode='update'. Install alembic to enable auto-migrations."
+            ) from exc
+
+        context = MigrationContext.configure(
+            sync_conn,
+            opts={
+                "target_metadata": Base.metadata,
+                "compare_type": True,
+                "compare_server_default": True,
+                "render_as_batch": True,
+            },
+        )
+        migration_script = alembic_autogen.produce_migrations(context, Base.metadata)
+        upgrade_ops = migration_script.upgrade_ops
+        if upgrade_ops.is_empty():
+            return
+
+        operations = Operations(context)
+
+        def targets_fsm(operation: alembic_ops.MigrateOperation) -> bool:
+            table_name = getattr(operation, "table_name", None)
+            if table_name is not None:
+                return table_name == self._table.name
+            if isinstance(operation, alembic_ops.OpContainer):
+                return any(targets_fsm(op) for op in operation.ops)
+            return False
+
+        def apply_ops(
+                container: alembic_ops.OpContainer,
+                executor: Union[Operations, BatchOperations],
+        ) -> None:
+            for operation in container.ops:
+                if not targets_fsm(operation):
+                    continue
+                if isinstance(operation, alembic_ops.ModifyTableOps):
+                    if not hasattr(executor, "batch_alter_table"):
+                        raise SchemaUpdateError(
+                            f"Nested batch operations are not supported for table `{self._table.name}`."
+                        )
+                    with executor.batch_alter_table(
+                            operation.table_name,
+                            schema=operation.schema,
+                    ) as batch_op:
+                        apply_ops(operation, batch_op)
+                elif isinstance(operation, alembic_ops.OpContainer):
+                    apply_ops(operation, executor)
+                else:
+                    executor.invoke(operation)
+
+        with context.begin_transaction():
+            apply_ops(upgrade_ops, operations)
+
 class SchemaModeEventContext:
     _STRATEGY_MAP: dict[SchemaMode, type[BaseSchemaModeStrategy]] = {
         SchemaMode.NONE: NoneSchemaModeStrategy,
         SchemaMode.CREATE: CreateSchemaModeStrategy,
         SchemaMode.CREATE_DROP: CreateDropSchemaModeStrategy,
+        SchemaMode.VALIDATE: ValidateSchemaModeStrategy,
+        SchemaMode.UPDATE: UpdateSchemaModeStrategy,
     }
 
     def __init__(self, schema_mode: SchemaMode, engine: AsyncEngine) -> None:
