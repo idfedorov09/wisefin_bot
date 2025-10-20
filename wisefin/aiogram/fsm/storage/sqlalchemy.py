@@ -15,7 +15,7 @@ from aiogram.fsm.storage.base import (
     StateType,
     StorageKey,
 )
-from sqlalchemy import String, DateTime, func, inspect
+from sqlalchemy import String, DateTime, Table, func, inspect
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -61,6 +61,9 @@ _default_schema_mode = SchemaMode(
 
 
 class BaseSchemaModeStrategy(ABC):
+    def __init__(self, table: Table) -> None:
+        self._table = table
+
     @abstractmethod
     async def on_start(self, engine: AsyncEngine) -> None:
         raise NotImplementedError
@@ -71,7 +74,6 @@ class BaseSchemaModeStrategy(ABC):
 
 
 class NoneSchemaModeStrategy(BaseSchemaModeStrategy):
-
     async def on_start(self, engine: AsyncEngine) -> None:
         pass
 
@@ -80,9 +82,6 @@ class NoneSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class CreateSchemaModeStrategy(BaseSchemaModeStrategy):
-    def __init__(self) -> None:
-        self._table = FSMRow.__table__
-
     async def on_start(self, engine: AsyncEngine) -> None:
         async with engine.begin() as conn:
             await conn.run_sync(self._recreate_table)
@@ -96,9 +95,6 @@ class CreateSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class CreateDropSchemaModeStrategy(BaseSchemaModeStrategy):
-    def __init__(self) -> None:
-        self._table = FSMRow.__table__
-
     async def on_start(self, engine: AsyncEngine) -> None:
         async with engine.begin() as conn:
             await conn.run_sync(self._create_table)
@@ -115,9 +111,6 @@ class CreateDropSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class ValidateSchemaModeStrategy(BaseSchemaModeStrategy):
-    def __init__(self) -> None:
-        self._table = FSMRow.__table__
-
     async def on_start(self, engine: AsyncEngine) -> None:
         async with engine.begin() as conn:
             await conn.run_sync(self._validate_table)
@@ -182,9 +175,6 @@ class ValidateSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class UpdateSchemaModeStrategy(BaseSchemaModeStrategy):
-    def __init__(self) -> None:
-        self._table = FSMRow.__table__
-
     async def on_start(self, engine: AsyncEngine) -> None:
         async with engine.begin() as conn:
             await conn.run_sync(self._auto_upgrade)
@@ -252,6 +242,7 @@ class UpdateSchemaModeStrategy(BaseSchemaModeStrategy):
         with context.begin_transaction():
             apply_ops(upgrade_ops, operations)
 
+
 class SchemaModeEventContext:
     _STRATEGY_MAP: dict[SchemaMode, type[BaseSchemaModeStrategy]] = {
         SchemaMode.NONE: NoneSchemaModeStrategy,
@@ -261,12 +252,17 @@ class SchemaModeEventContext:
         SchemaMode.UPDATE: UpdateSchemaModeStrategy,
     }
 
-    def __init__(self, schema_mode: SchemaMode, engine: AsyncEngine) -> None:
-        self._strategy: BaseSchemaModeStrategy = self._STRATEGY_MAP[schema_mode]()
+    def __init__(self, schema_mode: SchemaMode, engine: AsyncEngine, table: Table) -> None:
+        self._table = table
+        self._strategy: BaseSchemaModeStrategy = self._STRATEGY_MAP[schema_mode](self._table)
         self._engine: AsyncEngine = engine
 
+    def set_table(self, table: Table) -> "SchemaModeEventContext":
+        self._table = table
+        return self
+
     def set_strategy(self, strategy: SchemaMode) -> "SchemaModeEventContext":
-        self._strategy = self._STRATEGY_MAP[strategy]()
+        self._strategy = self._STRATEGY_MAP[strategy](self._table)
         return self
 
     def set_engine(self, engine: AsyncEngine) -> "SchemaModeEventContext":
@@ -388,6 +384,7 @@ class SQLAlchemyStorage(BaseStorage):
         self._schema_mode_event_ctx = SchemaModeEventContext(
             schema_mode=self._schema_mode,
             engine=self._engine,
+            table=cast(Table, FSMRow.__table__),
         )
         self._logger = logging.getLogger(__name__)
 
