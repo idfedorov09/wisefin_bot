@@ -33,7 +33,7 @@ async def start_polling():
     dp = Dispatcher(
         storage=await SQLAlchemyStorage.from_url(
             url=settings.DB_URL,
-            schema_mode=None
+            schema_mode=None,
         ),
         events_isolation=ChatEventIsolation()
     )

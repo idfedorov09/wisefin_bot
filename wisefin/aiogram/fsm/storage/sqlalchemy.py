@@ -35,10 +35,11 @@ except Exception:
 
 class SchemaMode(str, Enum):
     NONE = "none"
-    VALIDATE = "validate"
-    UPDATE = "update"
     CREATE = "create"
     CREATE_DROP = "create-drop"
+    VALIDATE = "validate"  # TODO: to impl
+    UPDATE = "update"  # TODO: to impl
+
 
 _Event = Literal["start", "stop"]
 
@@ -46,6 +47,75 @@ _Event = Literal["start", "stop"]
 _default_schema_mode = SchemaMode(
     os.getenv("AIOGRAM_SQLALCHEMY_STORAGE_SCHEMA_MODE", SchemaMode.CREATE_DROP.value)
 )
+
+
+class BaseSchemaModeStrategy(ABC):
+    @abstractmethod
+    async def on_start(self, engine: AsyncEngine) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def on_stop(self, engine: AsyncEngine) -> None:
+        raise NotImplementedError
+
+
+class NoneSchemaModeStrategy(BaseSchemaModeStrategy):
+
+    async def on_start(self, engine: AsyncEngine) -> None:
+        pass
+
+    async def on_stop(self, engine: AsyncEngine) -> None:
+        pass
+
+
+class CreateSchemaModeStrategy(BaseSchemaModeStrategy):
+
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def on_stop(self, engine: AsyncEngine) -> None:
+        pass
+
+
+class CreateDropSchemaModeStrategy(BaseSchemaModeStrategy):
+
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+    async def on_stop(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.drop_all)
+
+
+class SchemaModeEventContext:
+    _STRATEGY_MAP: dict[SchemaMode, type[BaseSchemaModeStrategy]] = {
+        SchemaMode.NONE: NoneSchemaModeStrategy,
+        SchemaMode.CREATE: CreateSchemaModeStrategy,
+        SchemaMode.CREATE_DROP: CreateDropSchemaModeStrategy,
+    }
+
+    def __init__(self, schema_mode: SchemaMode, engine: AsyncEngine) -> None:
+        self._strategy: BaseSchemaModeStrategy = self._STRATEGY_MAP[schema_mode]()
+        self._engine: AsyncEngine = engine
+
+    def set_strategy(self, strategy: SchemaMode) -> "SchemaModeEventContext":
+        self._strategy = self._STRATEGY_MAP[strategy]()
+        return self
+
+    def set_engine(self, engine: AsyncEngine) -> "SchemaModeEventContext":
+        self._engine = engine
+        return self
+
+    async def event(self, event: _Event) -> "SchemaModeEventContext":
+        if event == "start":
+            await self._strategy.on_start(self._engine)
+        elif event == "stop":
+            await self._strategy.on_stop(self._engine)
+        return self
+
 
 class Base(DeclarativeBase):
     pass
@@ -70,7 +140,7 @@ class BaseSessionContext(ABC):
 
     @abstractmethod
     def __call__(self) -> "BaseSessionContext":
-        """Возвращает новый контекстный менеджер (обычно self или новый экземпляр)."""
+        """Возвращает новый контекстный менеджер"""
         raise NotImplementedError
 
     @abstractmethod
@@ -80,7 +150,7 @@ class BaseSessionContext(ABC):
 
     @abstractmethod
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Выход из контекста, выполняет commit/rollback."""
+        """Выход из контекста"""
         raise NotImplementedError
 
 
@@ -146,11 +216,15 @@ class SQLAlchemyStorage(BaseStorage):
         self._engine: AsyncEngine = engine
         self._session_context = session_context \
                                 or SQLAlchemyStorage._make_simple_session_context(
-            engine,
+            self._engine,
             sessionmaker_kwargs,
             use_transaction
         )
         self._schema_mode = schema_mode or SchemaMode.NONE
+        self._schema_mode_event_ctx = SchemaModeEventContext(
+            schema_mode=self._schema_mode,
+            engine=self._engine,
+        )
         self._logger = logging.getLogger(__name__)
 
     @staticmethod
@@ -192,29 +266,7 @@ class SQLAlchemyStorage(BaseStorage):
         return storage
 
     async def schema_event(self, event: _Event) -> None:
-        # TODO: более красивая реализация?
-        # TODO: работать ТОЛЬКО с таблицей fsm
-        if self._schema_mode == SchemaMode.NONE:
-            return
-        elif self._schema_mode == SchemaMode.CREATE:
-            async with self._engine.begin() as conn:
-                if event == "start":
-                    self._logger.debug("Recreate fsm schema (drop and create)")
-                    await conn.run_sync(Base.metadata.drop_all)
-                    await conn.run_sync(Base.metadata.create_all)
-        elif self._schema_mode == SchemaMode.CREATE_DROP:
-            async with self._engine.begin() as conn:
-                if event == "start":
-                    self._logger.debug("Create fsm schema")
-                    await conn.run_sync(Base.metadata.create_all)
-                elif event == "stop":
-                    self._logger.debug("Drop fsm schema")
-                    await conn.run_sync(Base.metadata.drop_all)
-        elif self._schema_mode == SchemaMode.UPDATE:
-            raise NotImplementedError("Implement using alembic")
-        elif self._schema_mode == SchemaMode.VALIDATE:
-            raise NotImplementedError("Check the fact fsm_table is created with correct schema")
-
+        await self._schema_mode_event_ctx.event(event)
 
     @staticmethod
     def resolve_state(value: StateType) -> Optional[str]:
