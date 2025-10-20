@@ -80,25 +80,38 @@ class NoneSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class CreateSchemaModeStrategy(BaseSchemaModeStrategy):
+    def __init__(self) -> None:
+        self._table = FSMRow.__table__
 
     async def on_start(self, engine: AsyncEngine) -> None:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(self._recreate_table)
 
     async def on_stop(self, engine: AsyncEngine) -> None:
         pass
 
+    def _recreate_table(self, sync_conn) -> None:
+        self._table.drop(sync_conn, checkfirst=True)
+        self._table.create(sync_conn, checkfirst=True)
+
 
 class CreateDropSchemaModeStrategy(BaseSchemaModeStrategy):
+    def __init__(self) -> None:
+        self._table = FSMRow.__table__
 
     async def on_start(self, engine: AsyncEngine) -> None:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(self._create_table)
 
     async def on_stop(self, engine: AsyncEngine) -> None:
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(self._drop_table)
+
+    def _create_table(self, sync_conn) -> None:
+        self._table.create(sync_conn, checkfirst=True)
+
+    def _drop_table(self, sync_conn) -> None:
+        self._table.drop(sync_conn, checkfirst=True)
 
 
 class ValidateSchemaModeStrategy(BaseSchemaModeStrategy):
