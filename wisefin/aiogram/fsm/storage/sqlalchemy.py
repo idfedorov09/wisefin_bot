@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -404,7 +405,7 @@ class SQLAlchemyStorage(BaseStorage):
         )
 
     @classmethod
-    async def from_url(
+    async def create(
             cls,
             url: str,
             *,
@@ -424,7 +425,7 @@ class SQLAlchemyStorage(BaseStorage):
             sessionmaker_kwargs=sessionmaker_kwargs,
             schema_mode=schema_mode
         )
-        await storage.schema_event("start") # TODO: а если экземпляр создается через __init__ ?
+        await storage.schema_event("start")
         return storage
 
     async def schema_event(self, event: _Event) -> None:

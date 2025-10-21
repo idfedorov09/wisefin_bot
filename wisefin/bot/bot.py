@@ -31,7 +31,7 @@ async def start_polling():
     AppContext.set(bot)
 
     dp = Dispatcher(
-        storage=await SQLAlchemyStorage.from_url(
+        storage=await SQLAlchemyStorage.create(
             url=settings.DB_URL,
             schema_mode=None,
         ),
