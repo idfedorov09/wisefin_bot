@@ -65,28 +65,28 @@ class BaseSchemaModeStrategy(ABC):
         self._table = table
 
     @abstractmethod
-    def on_start(self, engine: AsyncEngine) -> None:
+    async def on_start(self, engine: AsyncEngine) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def on_stop(self, engine: AsyncEngine) -> None:
+    async def on_stop(self, engine: AsyncEngine) -> None:
         raise NotImplementedError
 
 
 class NoneSchemaModeStrategy(BaseSchemaModeStrategy):
-    def on_start(self, engine: AsyncEngine) -> None:
+    async def on_start(self, engine: AsyncEngine) -> None:
         pass
 
-    def on_stop(self, engine: AsyncEngine) -> None:
+    async def on_stop(self, engine: AsyncEngine) -> None:
         pass
 
 
 class CreateSchemaModeStrategy(BaseSchemaModeStrategy):
-    def on_start(self, engine: AsyncEngine) -> None:
-        with engine.sync_engine.begin() as conn:
-            self._recreate_table(conn)
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(self._recreate_table)
 
-    def on_stop(self, engine: AsyncEngine) -> None:
+    async def on_stop(self, engine: AsyncEngine) -> None:
         pass
 
     def _recreate_table(self, sync_conn) -> None:
@@ -95,13 +95,13 @@ class CreateSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class CreateDropSchemaModeStrategy(BaseSchemaModeStrategy):
-    def on_start(self, engine: AsyncEngine) -> None:
-        with engine.sync_engine.begin() as conn:
-            self._create_table(conn)
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(self._create_table)
 
-    def on_stop(self, engine: AsyncEngine) -> None:
-        with engine.sync_engine.begin() as conn:
-            self._drop_table(conn)
+    async def on_stop(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(self._drop_table)
 
     def _create_table(self, sync_conn) -> None:
         self._table.create(sync_conn, checkfirst=True)
@@ -111,11 +111,11 @@ class CreateDropSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class ValidateSchemaModeStrategy(BaseSchemaModeStrategy):
-    def on_start(self, engine: AsyncEngine) -> None:
-        with engine.sync_engine.begin() as conn:
-            self._validate_table(conn)
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(self._validate_table)
 
-    def on_stop(self, engine: AsyncEngine) -> None:
+    async def on_stop(self, engine: AsyncEngine) -> None:
         pass
 
     def _validate_table(self, sync_conn) -> None:
@@ -175,11 +175,11 @@ class ValidateSchemaModeStrategy(BaseSchemaModeStrategy):
 
 
 class UpdateSchemaModeStrategy(BaseSchemaModeStrategy):
-    def on_start(self, engine: AsyncEngine) -> None:
-        with engine.sync_engine.begin() as conn:
-            self._auto_upgrade(conn)
+    async def on_start(self, engine: AsyncEngine) -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(self._auto_upgrade)
 
-    def on_stop(self, engine: AsyncEngine) -> None:
+    async def on_stop(self, engine: AsyncEngine) -> None:
         pass
 
     def _auto_upgrade(self, sync_conn) -> None:
@@ -269,11 +269,11 @@ class SchemaModeEventContext:
         self._engine = engine
         return self
 
-    def event(self, event: _Event) -> "SchemaModeEventContext":
+    async def event(self, event: _Event) -> "SchemaModeEventContext":
         if event == "start":
-            self._strategy.on_start(self._engine)
+            await self._strategy.on_start(self._engine)
         elif event == "stop":
-            self._strategy.on_stop(self._engine)
+            await self._strategy.on_stop(self._engine)
         return self
 
 
@@ -389,8 +389,6 @@ class SQLAlchemyStorage(BaseStorage):
         )
         self._logger = logging.getLogger(__name__)
 
-        self.schema_event("start")
-
     @staticmethod
     def _make_simple_session_context(
             engine: AsyncEngine,
@@ -426,10 +424,11 @@ class SQLAlchemyStorage(BaseStorage):
             sessionmaker_kwargs=sessionmaker_kwargs,
             schema_mode=schema_mode
         )
+        await storage.schema_event("start") # TODO: а если экземпляр создается через __init__ ?
         return storage
 
-    def schema_event(self, event: _Event) -> None:
-        self._schema_mode_event_ctx.event(event)
+    async def schema_event(self, event: _Event) -> None:
+        await self._schema_mode_event_ctx.event(event)
 
     @staticmethod
     def resolve_state(value: StateType) -> Optional[str]:
@@ -512,5 +511,5 @@ class SQLAlchemyStorage(BaseStorage):
             return cast(Dict[str, Any], row.data or {}) if row else {}
 
     async def close(self) -> None:  # pragma: no cover
-        self.schema_event("stop")
+        await self.schema_event("stop")
         await self._engine.dispose()
