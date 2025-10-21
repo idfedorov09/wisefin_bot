@@ -56,9 +56,13 @@ class SchemaUpdateError(SchemaError):
 
 _Event = Literal["start", "stop"]
 
-_default_schema_mode = SchemaMode(
-    os.getenv("AIOGRAM_SQLALCHEMY_STORAGE_SCHEMA_MODE", SchemaMode.UPDATE.value)
+_default_schema_mode_raw = os.getenv(
+    "AIOGRAM_SQLALCHEMY_STORAGE_SCHEMA_MODE", SchemaMode.UPDATE.value
 )
+try:
+    _default_schema_mode: Union[SchemaMode, str] = SchemaMode(_default_schema_mode_raw)
+except ValueError:
+    _default_schema_mode = _default_schema_mode_raw
 
 
 class BaseSchemaModeStrategy(ABC):
@@ -244,26 +248,96 @@ class UpdateSchemaModeStrategy(BaseSchemaModeStrategy):
             apply_ops(upgrade_ops, operations)
 
 
-class SchemaModeEventContext:
-    _STRATEGY_MAP: dict[SchemaMode, type[BaseSchemaModeStrategy]] = {
-        SchemaMode.NONE: NoneSchemaModeStrategy,
-        SchemaMode.CREATE: CreateSchemaModeStrategy,
-        SchemaMode.CREATE_DROP: CreateDropSchemaModeStrategy,
-        SchemaMode.VALIDATE: ValidateSchemaModeStrategy,
-        SchemaMode.UPDATE: UpdateSchemaModeStrategy,
-    }
+class SchemaModeRegistry:
+    """Registry that maps schema mode identifiers to strategy classes."""
 
-    def __init__(self, schema_mode: SchemaMode, engine: AsyncEngine, table: Table) -> None:
-        self._table = table
-        self._strategy: BaseSchemaModeStrategy = self._STRATEGY_MAP[schema_mode](self._table)
+    _strategies: dict[str, type[BaseSchemaModeStrategy]] = {}
+
+    @classmethod
+    def normalize(cls, schema_mode: Union[SchemaMode, str]) -> str:
+        if isinstance(schema_mode, SchemaMode):
+            return schema_mode.value
+        if isinstance(schema_mode, str):
+            if not schema_mode:
+                raise SchemaError("Schema mode name cannot be empty.")
+            return schema_mode
+        raise TypeError(f"Unsupported schema mode type: {type(schema_mode)!r}")
+
+    @classmethod
+    def register(
+            cls,
+            schema_mode: Union[SchemaMode, str],
+            strategy_cls: type[BaseSchemaModeStrategy],
+    ) -> None:
+        mode_name = cls.normalize(schema_mode)
+        cls._strategies[mode_name] = strategy_cls
+
+    @classmethod
+    def get_strategy(
+            cls,
+            schema_mode: Union[SchemaMode, str],
+    ) -> type[BaseSchemaModeStrategy]:
+        mode_name = cls.normalize(schema_mode)
+        try:
+            return cls._strategies[mode_name]
+        except KeyError as exc:
+            raise SchemaError(
+                f"Schema mode `{mode_name}` is not registered. "
+                f"Use `register_schema_mode('{mode_name}', strategy_cls)` to add it."
+            ) from exc
+
+    @classmethod
+    def create_strategy(
+            cls,
+            schema_mode: Union[SchemaMode, str],
+            table: Table,
+    ) -> BaseSchemaModeStrategy:
+        strategy_cls = cls.get_strategy(schema_mode)
+        return strategy_cls(table)
+
+
+def register_schema_mode(
+        schema_mode: Union[SchemaMode, str],
+        strategy_cls: type[BaseSchemaModeStrategy],
+) -> None:
+    """
+    Register a new schema mode name and bind it to a strategy implementation.
+
+    :param schema_mode: Existing SchemaMode value or custom string identifier.
+    :param strategy_cls: Strategy that will handle start/stop lifecycle events.
+    """
+    SchemaModeRegistry.register(schema_mode, strategy_cls)
+
+
+SchemaModeRegistry.register(SchemaMode.NONE, NoneSchemaModeStrategy)
+SchemaModeRegistry.register(SchemaMode.CREATE, CreateSchemaModeStrategy)
+SchemaModeRegistry.register(SchemaMode.CREATE_DROP, CreateDropSchemaModeStrategy)
+SchemaModeRegistry.register(SchemaMode.VALIDATE, ValidateSchemaModeStrategy)
+SchemaModeRegistry.register(SchemaMode.UPDATE, UpdateSchemaModeStrategy)
+
+
+class SchemaModeEventContext:
+    def __init__(
+            self,
+            schema_mode: Union[SchemaMode, str],
+            engine: AsyncEngine,
+            table: Table,
+    ) -> None:
+        self._table: Table = table
+        self._mode_name: str = SchemaModeRegistry.normalize(schema_mode)
+        self._strategy: BaseSchemaModeStrategy = SchemaModeRegistry.create_strategy(
+            self._mode_name, self._table
+        )
         self._engine: AsyncEngine = engine
 
     def set_table(self, table: Table) -> "SchemaModeEventContext":
         self._table = table
+        self._strategy = SchemaModeRegistry.create_strategy(self._mode_name, self._table)
         return self
 
-    def set_strategy(self, strategy: SchemaMode) -> "SchemaModeEventContext":
-        self._strategy = self._STRATEGY_MAP[strategy](self._table)
+    def set_strategy(self, strategy: Union[SchemaMode, str]) -> "SchemaModeEventContext":
+        self._mode_name = SchemaModeRegistry.normalize(strategy)
+        self._strategy = SchemaModeRegistry.create_strategy(self._mode_name, self._table)
         return self
 
     def set_engine(self, engine: AsyncEngine) -> "SchemaModeEventContext":
@@ -371,8 +445,6 @@ class SQLAlchemyStorage(BaseStorage):
         # TODO: траблы с table_name
         if table_name != FSMRow.__tablename__:
             FSMRow.__tablename__ = table_name  # type: ignore[attr-defined]
-        if isinstance(schema_mode, str):
-            schema_mode = SchemaMode(schema_mode)
 
         self._key_builder: KeyBuilder = key_builder or DefaultKeyBuilder()
         self._engine: AsyncEngine = engine
@@ -382,7 +454,10 @@ class SQLAlchemyStorage(BaseStorage):
             sessionmaker_kwargs,
             use_transaction
         )
-        self._schema_mode = schema_mode or SchemaMode.NONE
+        effective_schema_mode: Union[SchemaMode, str] = (
+            schema_mode if schema_mode is not None else SchemaMode.NONE
+        )
+        self._schema_mode: str = SchemaModeRegistry.normalize(effective_schema_mode)
         self._schema_mode_event_ctx = SchemaModeEventContext(
             schema_mode=self._schema_mode,
             engine=self._engine,
